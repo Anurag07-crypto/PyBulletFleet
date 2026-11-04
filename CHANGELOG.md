@@ -14,6 +14,19 @@ are not recommended for production use yet.
 
 ### Added
 
+- `MultiRobotSimulationCore.query_aabb(aabb_min, aabb_max)`: the objects whose
+  AABB overlaps a box, looked up through the collision spatial hash, so the
+  cost follows how crowded the box is rather than how many objects the
+  simulation holds. Objects with collision `DISABLED` are tested directly, as
+  the hash does not track them; inside a step, a pose written but not yet
+  flushed is answered with the AABB the object had when the step began.
+  `MultiRobotSimulationCore.pickable_candidates_near(position, radius)`: the
+  same lookup for a search by base origin, which also covers pickable objects
+  whose shape is set far off their origin.
+  `SimObject.find_nearest_pickable()` and an `Elevator`'s passenger scan now
+  use them: in a scene of 22,000 static tiles, `find_nearest_pickable()` went
+  from about 55 ms to 0.02 ms, with the same result.
+
 - `Agent.set_joint_position(joint, position)`: put a joint at a position at
   once, without moving it there, as `set_pose()` does for the base. The
   position becomes the joint's target and any profile speed is dropped, so the

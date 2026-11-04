@@ -24,6 +24,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -571,6 +572,13 @@ class MultiRobotSimulationCore:
         self._cached_aabbs_dict: Dict[int, Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = (
             {}
         )  # object_id -> AABB
+        # Pickable objects whose base origin lies outside their cached AABB,
+        # with the largest per-axis distance from the origin to the box. Lets
+        # a search by base origin (pickable_candidates_near) go through the
+        # spatial hash, which holds AABBs, without missing a shape set far off
+        # its origin. Only pickable objects: nothing else is searched by origin,
+        # and the AABB update of every moved object stays free of it.
+        self._origin_gaps: Dict[int, float] = {}
         self._cached_spatial_grid: Dict[Tuple[int, int, int], Set[int]] = {}  # Spatial hash grid: cell -> {object_ids}
         # The broadphase margin the grid's registrations were made with. A pair
         # within the margin is found only if both bodies were registered with
@@ -1974,7 +1982,9 @@ class MultiRobotSimulationCore:
             return
 
         try:
-            self._cached_aabbs_dict[object_id] = p.getAABB(obj.body_id, physicsClientId=self._client)
+            aabb = p.getAABB(obj.body_id, physicsClientId=self._client)
+            self._cached_aabbs_dict[object_id] = aabb
+            self._record_origin_gap(obj, aabb)
             logger.debug(f"Updated AABB for object {object_id}")
 
             # Also update spatial grid if requested and cell_size is initialized
@@ -1987,6 +1997,44 @@ class MultiRobotSimulationCore:
             # performCollisionDetection() / stepSimulation() call.
             logger.debug(f"Deferred AABB init for object {object_id} (body {obj.body_id})")
 
+    def _record_origin_gap(self, obj: SimObject, aabb: Tuple[Sequence[float], Sequence[float]]) -> None:
+        """Note how far a pickable ``obj``'s base origin lies outside its AABB, if at all.
+
+        A kinematic object's pose is its cached one; a physics object's is read
+        from PyBullet, as its cache may still hold the pose of the last step.
+        Objects that are not pickable are not tracked (see
+        :meth:`_on_pickable_changed` for one that becomes pickable).
+        """
+        if not obj.pickable:
+            self._origin_gaps.pop(obj.object_id, None)
+            return
+        if obj.is_kinematic:
+            x, y, z = obj.get_pose().position
+        else:
+            (x, y, z), _ = p.getBasePositionAndOrientation(obj.body_id, physicsClientId=self._client)
+        (x0, y0, z0), (x1, y1, z1) = aabb
+        gap = max(x0 - x, x - x1, y0 - y, y - y1, z0 - z, z - z1)
+        if gap > 0.0:
+            self._origin_gaps[obj.object_id] = gap
+        else:
+            self._origin_gaps.pop(obj.object_id, None)
+
+    def _on_pickable_changed(self, obj: SimObject) -> None:
+        """Start or stop tracking ``obj``'s origin gap when its ``pickable`` flag changes.
+
+        Called by the ``SimObject.pickable`` setter. An object that becomes
+        pickable while standing still would otherwise have no gap recorded
+        until it next moves.
+        """
+        object_id = getattr(obj, "object_id", None)
+        if object_id is None:
+            return
+        aabb = self._cached_aabbs_dict.get(object_id)
+        if aabb is None:
+            self._origin_gaps.pop(object_id, None)
+            return
+        self._record_origin_gap(obj, aabb)
+
     def _remove_object_aabb(self, object_id: int, update_grid: bool = True) -> None:
         """
         Remove AABB and spatial grid entry for an object.
@@ -1996,6 +2044,7 @@ class MultiRobotSimulationCore:
             object_id: The object_id to remove from AABB cache
         """
         # Remove from AABB cache
+        self._origin_gaps.pop(object_id, None)
         if object_id in self._cached_aabbs_dict:
             self._cached_aabbs_dict.pop(object_id)
             logger.debug(f"Removed object {object_id} from AABB cache")
@@ -2658,6 +2707,7 @@ class MultiRobotSimulationCore:
         self._kinematic_objects.discard(obj_id)
         self._static_collision_objects.discard(obj_id)
         self._disabled_collision_objects.discard(obj_id)
+        self._origin_gaps.pop(obj_id, None)
 
         # Remove from collision mode cache
         self._cached_collision_modes.pop(obj_id, None)
@@ -3156,6 +3206,117 @@ class MultiRobotSimulationCore:
             self._camera_controller = CameraController(client_id=self._client)
             logger.info("Interactive camera controls enabled: right-drag/arrows=pan, +/-=zoom, o=top-down")
 
+    def query_aabb(self, aabb_min: Sequence[float], aabb_max: Sequence[float]) -> List[SimObject]:
+        """Objects whose AABB overlaps the box ``[aabb_min, aabb_max]``.
+
+        Looks only at the objects registered in the collision spatial hash
+        cells the box reaches, so the cost depends on how crowded the box is,
+        not on how many objects the simulation holds. Every object is
+        registered in each cell its AABB reaches, and kinematic and physics
+        objects are re-registered on every step whatever the collision check
+        frequency, so the hash answers for the current step. Before the hash
+        exists, or when the box spans more cells than there are objects, every
+        object is tested instead.
+
+        Objects with collision ``DISABLED`` are not in the hash; they are
+        tested directly against their PyBullet AABB. A pose written outside a
+        step is applied at once and answered for. Inside a step (from a
+        callback or a controller), a written pose is buffered and reaches
+        PyBullet only when the step flushes it: until then such an object is
+        tested against the AABB of the pose it had when the step began.
+
+        Args:
+            aabb_min: ``(x, y, z)`` lower corner of the box, world frame.
+            aabb_max: ``(x, y, z)`` upper corner of the box, world frame.
+
+        Returns:
+            The overlapping objects, in no particular order.
+
+        Example::
+
+            # Everything within 0.5 m of a point, as a box
+            nearby = sim.query_aabb((x - 0.5, y - 0.5, z - 0.5), (x + 0.5, y + 0.5, z + 0.5))
+        """
+        lo = tuple(float(v) for v in aabb_min)
+        hi = tuple(float(v) for v in aabb_max)
+
+        def overlaps(box: Tuple[Sequence[float], Sequence[float]]) -> bool:
+            (x0, y0, z0), (x1, y1, z1) = box
+            return x0 <= hi[0] and x1 >= lo[0] and y0 <= hi[1] and y1 >= lo[1] and z0 <= hi[2] and z1 >= lo[2]
+
+        objects = self._sim_objects_dict
+        cached = self._cached_aabbs_dict
+        stale = self._pending_pose_ids
+        candidate_ids: Iterable[int] = objects.keys()
+        if self._cached_cell_size is not None:
+            x_range = range(self._coord_to_cell(lo[0]), self._coord_to_cell(hi[0]) + 1)
+            y_range = range(self._coord_to_cell(lo[1]), self._coord_to_cell(hi[1]) + 1)
+            z_range = range(self._coord_to_cell(lo[2]), self._coord_to_cell(hi[2]) + 1)
+        if self._cached_cell_size is not None and len(x_range) * len(y_range) * len(z_range) <= len(objects):
+            ids: Set[int] = set()
+            grid = self._cached_spatial_grid
+            empty = self._EMPTY_SET
+            for x in x_range:
+                for y in y_range:
+                    for z in z_range:
+                        ids.update(grid.get((x, y, z), empty))
+            ids.update(self._disabled_collision_objects)
+            ids.update(stale)
+            candidate_ids = ids
+
+        found = []
+        for object_id in candidate_ids:
+            obj = objects.get(object_id)
+            if obj is None:
+                continue
+            box = cached.get(object_id)
+            if box is None or object_id in stale:
+                try:
+                    box = p.getAABB(obj.body_id, physicsClientId=self._client)
+                except p.error:
+                    continue
+            if overlaps(box):
+                found.append(obj)
+        return found
+
+    def pickable_candidates_near(self, position: Sequence[float], radius: float) -> List[SimObject]:
+        """Every pickable object whose base origin may be within ``radius`` of ``position``.
+
+        A superset, for a search by base origin such as
+        :meth:`SimObject.find_nearest_pickable`: it may also hold objects
+        farther away or not pickable, so the caller measures the distance and
+        checks ``pickable`` itself. The objects come through the spatial hash,
+        as for :meth:`query_aabb`, plus those the hash cannot place by their
+        origin: a pickable shape set more than a cell off its origin, objects
+        with collision ``DISABLED``, and objects with a pose written in the
+        current step and not yet flushed (their cached pose is already the new
+        one). Before the hash exists, every object.
+
+        Args:
+            position: ``(x, y, z)`` to search around, world frame.
+            radius: Search radius in metres.
+
+        Returns:
+            The candidate objects, in no particular order.
+        """
+        cell = self._cached_cell_size
+        if cell is None:
+            return list(self._sim_objects)
+        # An origin a little outside its AABB (a mesh with its origin at a
+        # corner, say) is still within the box widened by one cell.
+        reach = radius + cell
+        found = {obj.object_id: obj for obj in self.query_aabb([c - reach for c in position], [c + reach for c in position])}
+        objects = self._sim_objects_dict
+        extra = [object_id for object_id, gap in self._origin_gaps.items() if gap > cell]
+        extra.extend(self._disabled_collision_objects)
+        extra.extend(self._pending_pose_ids)
+        for object_id in extra:
+            if object_id not in found:
+                obj = objects.get(object_id)
+                if obj is not None:
+                    found[object_id] = obj
+        return list(found.values())
+
     def get_aabbs(self) -> List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]:
         """Get AABBs for all simulation objects."""
         return [p.getAABB(obj.body_id, physicsClientId=self._client) for obj in self._sim_objects]
@@ -3233,7 +3394,9 @@ class MultiRobotSimulationCore:
                 p.performCollisionDetection(physicsClientId=self._client)
             logger.debug(f"Full AABB rebuild for {len(self._sim_objects)} objects")
             for obj in self._sim_objects:
-                self._cached_aabbs_dict[obj.object_id] = p.getAABB(obj.body_id, physicsClientId=self._client)
+                aabb = p.getAABB(obj.body_id, physicsClientId=self._client)
+                self._cached_aabbs_dict[obj.object_id] = aabb
+                self._record_origin_gap(obj, aabb)
             # Mark cache as valid after update
             self._aabb_cache_valid = True
 
@@ -4014,6 +4177,7 @@ class MultiRobotSimulationCore:
         self._dynamic_collision_objects.clear()
         self._cached_collision_modes.clear()
         self._cached_aabbs_dict.clear()
+        self._origin_gaps.clear()
         self._cached_spatial_grid.clear()
         self._cached_object_to_cell.clear()
         self._cached_cell_size = None
