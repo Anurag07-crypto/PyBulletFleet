@@ -73,18 +73,39 @@ class ElevatorStateMachine:
         """Floor requests waiting for the current transition to complete."""
         return tuple(self._pending_floors)
 
-    def request_floor(self, floor_name: str) -> ElevatorRequestResult:
+    def request_floor(self, floor_name: str, instant: bool = False) -> ElevatorRequestResult:
         """Accept, queue, replace, redirect, or reject a requested destination.
 
-        Only ``REDIRECT`` turns a moving cabin toward a new floor; it keeps its
-        passengers and drops any pending floor, so the latest request wins.
+        Apart from an ``instant`` request (below), only ``REDIRECT`` turns a
+        moving cabin toward a new floor; it keeps its passengers and drops any
+        pending floor, so the latest request wins.
         ``REPLACE_NEXT`` replaces the pending destination after the current
         trip, and a request for the floor the cabin is already heading to
         drops it -- the caller changed its mind back. ``QUEUE`` preserves
         requests in arrival order.
+
+        ``instant`` puts the cabin at the floor at once instead of riding there,
+        with its passengers aboard; the next :meth:`update` observes the
+        arrival as after any trip. It is always accepted for another floor,
+        whatever the policy, also while the cabin is moving: the cabin is then
+        put at the new floor with the passengers of the current trip, pending
+        requests are dropped, and the result is ``REDIRECTED``.
         """
         if floor_name not in self._floors:
             return ElevatorRequestResult.REJECTED
+
+        if instant:
+            if self.state is ElevatorState.MOVING:
+                if floor_name == self.target_floor and not self._adapter.motion_in_progress():
+                    return ElevatorRequestResult.REJECTED
+                self._pending_floors.clear()
+                self.target_floor = floor_name
+                self._adapter.begin_motion(self._floors[floor_name], instant=True)
+                return ElevatorRequestResult.REDIRECTED
+            if floor_name == self.current_floor:
+                return ElevatorRequestResult.REJECTED
+            self._start_motion(floor_name, instant=True)
+            return ElevatorRequestResult.ACCEPTED
 
         if self.state is ElevatorState.MOVING:
             if floor_name == self.target_floor:
@@ -117,10 +138,13 @@ class ElevatorStateMachine:
         self._start_motion(floor_name)
         return ElevatorRequestResult.ACCEPTED
 
-    def _start_motion(self, floor_name: str) -> None:
+    def _start_motion(self, floor_name: str, instant: bool = False) -> None:
         self._adapter.attach_platform_passengers()
         self.target_floor = floor_name
-        self._adapter.begin_motion(self._floors[floor_name])
+        if instant:
+            self._adapter.begin_motion(self._floors[floor_name], instant=True)
+        else:
+            self._adapter.begin_motion(self._floors[floor_name])
         self.state = ElevatorState.MOVING
 
     def update(self) -> bool:

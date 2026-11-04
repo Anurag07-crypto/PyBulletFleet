@@ -14,6 +14,27 @@ are not recommended for production use yet.
 
 ### Added
 
+- `Agent.set_joint_position(joint, position)`: put a joint at a position at
+  once, without moving it there, as `set_pose()` does for the base. The
+  position becomes the joint's target and any profile speed is dropped, so the
+  joint stays there; objects attached to the links follow, and the body counts
+  as moved for the next collision check. With physics on, `max_force` (default
+  500, as in `set_joint_target`) holds it there. A position outside the URDF
+  limits is applied with a warning; a fixed joint is refused with one.
+
+- `Agent.set_joints_positions(positions)`: the same for several joints, taking
+  a list for every joint or a dict by name or index, as `set_joints_targets`
+  does. Attached objects follow once, after all of them are placed.
+
+- `Elevator.request_floor(floor, instant=True)`: the cabin is at the floor at
+  once with its passengers aboard, instead of riding there; the next update
+  observes the arrival and releases them as after any trip. Accepted also
+  while the cabin is moving, whatever the request policy: the cabin is put at
+  the new floor with the passengers of its trip, the pending requests are
+  dropped, and the result is `REDIRECTED`.
+  `ElevatorMotionAdapter.begin_motion` takes the matching `instant` flag,
+  passed only when a request asks for it.
+
 - `ElevatorRequestPolicy.REDIRECT`: a request received while the cabin is
   moving turns it toward the new floor at once, with its passengers, and drops
   any pending floor, so the latest request wins (`ElevatorRequestResult.REDIRECTED`).
