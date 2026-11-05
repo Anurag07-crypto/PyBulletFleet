@@ -542,6 +542,31 @@ are not recommended for production use yet.
 
 ### Fixed
 
+- `import pybullet_fleet` works where the `tkinter` package is present but the
+  Tk library is not (for example a `python:*-slim` container image without
+  `tk`): importing `tkinter` there raises `ImportError`, which was not caught,
+  so the package failed to import even with the monitor off. Without Tk, a
+  headless simulation no longer logs anything about it; asking for the monitor
+  window logs why it is unavailable and falls back to writing the monitor file,
+  at the refresh rate of a run without the window. The standalone
+  `python -m pybullet_fleet.data_monitor` exits with that warning instead of
+  waiting for a window that never opens.
+
+- The monitor window on a host with Tk but no display (no `DISPLAY`, as on a
+  CI runner or an SSH session): `DataMonitor.start()` printed a `TclError`
+  traceback from the monitor thread and kept `enable_gui` and `running` set,
+  so the simulation refreshed the monitor file at the window rate. It now logs
+  why the window could not open and falls back to writing the monitor file, at
+  the refresh rate of a run without the window. `start()` waits (up to 5 s)
+  for the monitor thread to try to open the window, so `enable_gui` tells
+  whether one opened when it returns. The standalone
+  `python -m pybullet_fleet.data_monitor` exits with that warning.
+  `DataMonitor.stop()` called while the window is open no longer hangs: it
+  closed the window with Tk calls from the calling thread, which wait for the
+  Tk thread and never returned once its main loop had ended. It now asks the
+  Tk thread to close the window and waits up to 3 s for it to end, logging a
+  warning if it does not.
+
 - `Agent.from_mesh()` creates its shapes and body on the simulation's physics
   client, as `SimObject.from_mesh()` does; it used PyBullet's default client,
   so with a second client connected (two simulations in one process, or a
