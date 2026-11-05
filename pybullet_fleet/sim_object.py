@@ -13,7 +13,13 @@ import pybullet as p
 
 from .geometry import Pose
 from .logging_utils import get_lazy_logger, get_named_lazy_logger
-from .types import CollisionMode
+from .types import (
+    CollisionMode,
+    _normal_2d_warning_already_given,
+    _spawning_from_warned_params,
+    _warn_if_new_object_is_normal_2d,
+    _warn_if_normal_2d,
+)
 from .tools import resolve_link_index
 from pybullet_fleet._defaults import SIM_OBJECT as _OBJ_D, SHAPE as _SHP_D
 from pybullet_fleet.config_utils import forward_spawn_params as _forward_spawn_params
@@ -261,6 +267,13 @@ class SimObjectSpawnParams:
     # AgentSpawnParams and ElevatorParams, which inherit them -- is unchanged.
     urdf_path: Optional[str] = None
 
+    def __post_init__(self):
+        """Warn about a deprecated collision mode."""
+        _warn_if_normal_2d(self.collision_mode)
+        # Not a field: from_params() reads it to tell whether NORMAL_2D was set
+        # here (warned, or deliberately silenced) or assigned afterwards.
+        self._normal_2d_warned = self.collision_mode is CollisionMode.NORMAL_2D
+
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "SimObjectSpawnParams":
         """Create SimObjectSpawnParams from a configuration dictionary.
@@ -364,7 +377,7 @@ class SimObject:
         body_id: PyBullet body ID
         mass: Object mass in kg
         pickable: Whether this object can be picked by robots
-        collision_mode: Collision detection mode (NORMAL_3D, NORMAL_2D, STATIC, DISABLED)
+        collision_mode: Collision detection mode (NORMAL_3D, STATIC, DISABLED; NORMAL_2D is deprecated)
         user_data: Dictionary for custom metadata (default: empty dict)
     """
 
@@ -408,6 +421,7 @@ class SimObject:
         self.attached_objects: List["SimObject"] = []
         self.callbacks: List[dict] = []
         self._pickable = pickable
+        _warn_if_new_object_is_normal_2d(self, collision_mode)
         self.collision_mode = collision_mode  # Collision detection mode
 
         # User-extensible data storage (custom metadata)
@@ -926,16 +940,17 @@ class SimObject:
         )
         # Keep the effective factory inputs for declared kinematic checkpoint
         # handlers. Direct body-id construction remains unsupported.
-        obj._checkpoint_spawn_params = SimObjectSpawnParams(
-            name=name,
-            visual_shape=copy.deepcopy(visual_shape),
-            collision_shape=copy.deepcopy(collision_shape),
-            initial_pose=copy.deepcopy(pose),
-            mass=mass,
-            pickable=pickable,
-            collision_mode=collision_mode,
-            user_data=dict(user_data) if user_data else {},
-        )
+        with _normal_2d_warning_already_given():  # __init__ above already warned
+            obj._checkpoint_spawn_params = SimObjectSpawnParams(
+                name=name,
+                visual_shape=copy.deepcopy(visual_shape),
+                collision_shape=copy.deepcopy(collision_shape),
+                initial_pose=copy.deepcopy(pose),
+                mass=mass,
+                pickable=pickable,
+                collision_mode=collision_mode,
+                user_data=dict(user_data) if user_data else {},
+            )
         if sim_core is not None:
             record_spawn = getattr(sim_core, "_record_state_spawn", None)
             if record_spawn is not None:
@@ -1025,17 +1040,18 @@ class SimObject:
         )
         # Keep the complete effective construction for future declared URDF
         # handlers. The built-in kinematic profile still rejects URDF objects.
-        obj._checkpoint_spawn_params = _UrdfSpawnDescriptor(
-            urdf_path=loaded.path,
-            name=name,
-            initial_pose=copy.deepcopy(pose) if pose is not None else Pose.from_xyz(0.0, 0.0, 0.0),
-            mass=loaded.mass,
-            pickable=pickable,
-            collision_mode=collision_mode,
-            user_data=dict(user_data) if user_data else {},
-            use_fixed_base=use_fixed_base,
-            global_scaling=global_scaling,
-        )
+        with _normal_2d_warning_already_given():  # __init__ above already warned
+            obj._checkpoint_spawn_params = _UrdfSpawnDescriptor(
+                urdf_path=loaded.path,
+                name=name,
+                initial_pose=copy.deepcopy(pose) if pose is not None else Pose.from_xyz(0.0, 0.0, 0.0),
+                mass=loaded.mass,
+                pickable=pickable,
+                collision_mode=collision_mode,
+                user_data=dict(user_data) if user_data else {},
+                use_fixed_base=use_fixed_base,
+                global_scaling=global_scaling,
+            )
         if sim_core is not None:
             record_spawn = getattr(sim_core, "_record_state_spawn", None)
             if record_spawn is not None:
@@ -1171,14 +1187,15 @@ class SimObject:
             obj = SimObject.from_params(params, sim_core)
         """
         factory = cls.from_urdf if spawn_params.urdf_path is not None else cls.from_mesh
-        return factory(
-            **_forward_spawn_params(
-                factory,
-                spawn_params,
-                aliases={"initial_pose": "pose"},
-                extra_kwargs={"sim_core": sim_core},
+        with _spawning_from_warned_params(cls, spawn_params):
+            return factory(
+                **_forward_spawn_params(
+                    factory,
+                    spawn_params,
+                    aliases={"initial_pose": "pose"},
+                    extra_kwargs={"sim_core": sim_core},
+                )
             )
-        )
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any], sim_core=None) -> "SimObject":
@@ -1227,9 +1244,10 @@ class SimObject:
             # Disable collision
             obj.set_collision_mode(CollisionMode.DISABLED)
 
-            # Enable 2D collision
-            obj.set_collision_mode(CollisionMode.NORMAL_2D)
+            # Enable collision again
+            obj.set_collision_mode(CollisionMode.NORMAL_3D)
         """
+        _warn_if_normal_2d(mode)
         if self.collision_mode == mode:
             return  # No change
 
@@ -1383,7 +1401,7 @@ class SimObject:
             self._log.warning(
                 "Attempting to move static object. "
                 "Static objects (CollisionMode.STATIC) should not be moved. "
-                "If this object needs to move, change collision_mode to NORMAL_3D/NORMAL_2D."
+                "If this object needs to move, change collision_mode to NORMAL_3D."
             )
             return False
 
