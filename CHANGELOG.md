@@ -584,6 +584,11 @@ are not recommended for production use yet.
 
 ### Fixed
 
+- `auto_detect_profile(body_id)` puts every movable joint back at the
+  position and velocity it had before probing the arm reach, also when
+  probing raises partway. It set them all to zero, which changed the pose of
+  a live body and left an agent's joint state and cached AABB out of date.
+
 - An active `CLOSEST_POINTS` (or kinematic `HYBRID`) pair with a `NORMAL_2D`
   body now resolves once the bodies no longer overlap in z, as a pair in that
   position is not reported in the first place. It stayed active while their
