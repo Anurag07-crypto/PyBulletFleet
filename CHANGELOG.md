@@ -14,6 +14,19 @@ are not recommended for production use yet.
 
 ### Added
 
+- `ControllerParams.max_angular_decel`: the braking rate of a turn, so a
+  rotation can stop at a different rate than it starts, as `max_linear_decel`
+  already allows for translation. Same scalar or per-axis form as
+  `max_angular_accel`; unset mirrors it, so every existing configuration keeps
+  the same symmetric rotation profile, bit for bit. A zero, negative or
+  non-finite value (or a per-axis value whose yaw component is not above
+  zero) raises `ValueError` when it is set, not at the first turn. Every rotation honours it:
+  per-agent and batched, omnidirectional final rotation and differential-drive
+  turns, with `Agent.max_angular_decel` as the read-only view. The batched
+  controllers carry the braking scalar per row, and their closed form agrees
+  with the per-agent trajectory to floating-point noise. The kinematic replay profile records it; a `pbf.kinematic.v4`
+  artifact recorded before it existed still loads, with the field unset.
+
 - `PathRequest` (`pybullet_fleet.path_request`): the waypoints and how to follow
   them (`final_orientation_align`, `direction`, `auto_approach`) as one
   object. `Agent.request_path(request)` and the controllers'
@@ -642,6 +655,14 @@ are not recommended for production use yet.
   deprecation, and the design plans under `docs/design/` are left as written.
 
 ### Fixed
+
+- `BatchOmniController` and `BatchDifferentialController` turn at the yaw
+  (`z`) component of a per-axis angular limit (`max_angular_vel`,
+  `max_angular_accel`, `max_angular_decel` given as `[x, y, z]`), as the
+  per-agent controllers do. Before this change they read the `x` component.
+  A batched agent whose `x` and `z` limits differ now turns at a different
+  rate than before, the same as its per-agent counterpart, and a limit such as
+  `[0, 0, 2]` no longer raises `ValueError` in the batched path only.
 
 - The collision broadphase AABB of an articulated body covers all of its
   links, not only the base link (issue #68). `p.getAABB(body)` returns the base
